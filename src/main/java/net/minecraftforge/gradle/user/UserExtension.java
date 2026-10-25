@@ -1,0 +1,96 @@
+package net.minecraftforge.gradle.user;
+
+import com.google.common.base.Strings;
+import net.minecraftforge.gradle.common.BaseExtension;
+
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Map.Entry;
+
+public class UserExtension extends BaseExtension {
+    public transient UserBasePlugin<? extends UserExtension> plugin;
+    private HashMap<String, Object> replacements = new HashMap<>();
+    private List<String> includes = new ArrayList<>();
+    private boolean isDecomp = false;
+    private List<String> clientJvmArgs = new ArrayList<>();
+    private List<String> serverJvmArgs = new ArrayList<>();
+    private boolean excludeScalaLibs = true;
+    private boolean excludeTwitchLib = true;
+
+    public UserExtension(UserBasePlugin<? extends UserExtension> plugin) {
+        super(plugin);
+        this.plugin = plugin;
+    }
+
+    public void replace(Object token, Object replacement) {
+        replacements.put(token.toString(), replacement);
+    }
+
+    public void replace(Map<Object, Object> map) {
+        for (Entry<Object, Object> e : map.entrySet()) {
+            replace(e.getKey(), e.getValue());
+        }
+    }
+
+    public Map<String, Object> getReplacements() {
+        return replacements;
+    }
+
+    public List<String> getIncludes() {
+        return includes;
+    }
+
+    public void replaceIn(String path) {
+        includes.add(path);
+    }
+
+    public boolean isDecomp() {
+        return isDecomp;
+    }
+
+    public void setDecomp() {
+        this.isDecomp = true;
+    }
+
+    public void setMappings(String mappings) {
+        super.setMappings(mappings);
+
+        if (!Strings.isNullOrEmpty(mappings)) {
+            this.setMcpVersion(mappings);
+        }
+    }
+
+    public List<String> getClientJvmArgs() {
+        return clientJvmArgs;
+    }
+
+    public void setClientJvmArgs(List<String> clientJvmArgs) {
+        this.clientJvmArgs = clientJvmArgs;
+    }
+
+    public List<String> getServerJvmArgs() {
+        return serverJvmArgs;
+    }
+
+    public void setServerJvmArgs(List<String> serverJvmArgs) {
+        this.serverJvmArgs = serverJvmArgs;
+    }
+
+    public boolean isExcludeScalaLibs() {
+        return excludeScalaLibs;
+    }
+
+    public void setExcludeScalaLibs(boolean excludeScalaLibs) {
+        this.excludeScalaLibs = excludeScalaLibs;
+    }
+
+    public boolean isExcludeTwitchLib() {
+        return excludeTwitchLib;
+    }
+
+    public void setExcludeTwitchLib(boolean excludeTwitchLib) {
+        this.excludeTwitchLib = excludeTwitchLib;
+    }
+}

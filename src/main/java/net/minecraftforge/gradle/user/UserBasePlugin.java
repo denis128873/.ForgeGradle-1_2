@@ -1,0 +1,1649 @@
+package net.minecraftforge.gradle.user;
+
+import com.google.common.base.Strings;
+import com.google.common.base.Throwables;
+import com.google.common.collect.ImmutableMap;
+import com.google.gson.JsonIOException;
+import com.google.gson.JsonSyntaxException;
+import groovy.lang.Closure;
+import net.minecraftforge.gradle.*;
+import net.minecraftforge.gradle.common.BasePlugin;
+import net.minecraftforge.gradle.common.Constants;
+import net.minecraftforge.gradle.delayed.DelayedFile;
+import net.minecraftforge.gradle.json.JsonFactory;
+import net.minecraftforge.gradle.json.version.Library;
+import net.minecraftforge.gradle.tasks.*;
+import net.minecraftforge.gradle.tasks.abstractutil.EditJarTask;
+import net.minecraftforge.gradle.tasks.abstractutil.ExtractTask;
+import net.minecraftforge.gradle.tasks.user.SourceCopyTask;
+import net.minecraftforge.gradle.tasks.user.reobf.ReobfTask;
+import org.gradle.api.*;
+import org.gradle.api.artifacts.Configuration.State;
+import org.gradle.api.artifacts.dsl.DependencyHandler;
+import org.gradle.api.file.SourceDirectorySet;
+import org.gradle.api.internal.plugins.DslObject;
+import org.gradle.api.logging.Logger;
+import org.gradle.api.logging.configuration.WarningMode;
+import org.gradle.api.plugins.JavaPlugin;
+import org.gradle.api.specs.Spec;
+import org.gradle.api.tasks.*;
+import org.gradle.api.tasks.bundling.Jar;
+import org.gradle.api.tasks.bundling.Zip;
+import org.gradle.api.tasks.compile.GroovyCompile;
+import org.gradle.api.tasks.compile.JavaCompile;
+import org.gradle.api.tasks.scala.ScalaCompile;
+import org.gradle.api.artifacts.Dependency;
+import org.gradle.api.artifacts.repositories.MavenArtifactRepository;
+import org.gradle.jvm.toolchain.JavaLanguageVersion;
+import org.gradle.jvm.toolchain.JavaToolchainService;
+import org.gradle.plugins.ide.idea.model.IdeaModel;
+import org.w3c.dom.DOMException;
+import org.w3c.dom.Document;
+import org.w3c.dom.Element;
+import org.w3c.dom.NodeList;
+
+import javax.xml.parsers.DocumentBuilder;
+import javax.xml.parsers.DocumentBuilderFactory;
+import javax.xml.transform.OutputKeys;
+import javax.xml.transform.Transformer;
+import javax.xml.transform.TransformerFactory;
+import javax.xml.transform.dom.DOMSource;
+import javax.xml.transform.stream.StreamResult;
+import java.io.File;
+import java.io.FileInputStream;
+import java.io.IOException;
+import java.net.MalformedURLException;
+import java.net.URISyntaxException;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.StandardCopyOption;
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.Collections;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Locale;
+import java.util.Map;
+import java.util.Set;
+import java.util.TreeMap;
+import java.util.zip.ZipEntry;
+import java.util.zip.ZipFile;
+
+import static net.minecraftforge.gradle.common.Constants.*;
+import static net.minecraftforge.gradle.user.UserConstants.*;
+
+public abstract class UserBasePlugin<T extends UserExtension> extends BasePlugin<T> {
+    boolean mavenPluginEnabled = false;
+    boolean wrapperArtifact = false;
+    private String generatedWorkspaceFingerprint;
+    private String generatedWorkspaceVersion;
+    private File generatedWorkspaceRepository;
+    private File generatedWorkspacePom;
+    private boolean generatedWorkspaceCacheHit;
+
+    @Override
+    public void applyPlugin() {
+        this.applyExternalPlugin("java");
+        mavenPluginEnabled = !ProjectUtils.getBooleanProperty(project, "com.anatawa12.forge.gradle.no-maven-plugin")
+                && GradleVersionUtils.isBefore("7.0");
+        wrapperArtifact = ProjectUtils.getBooleanProperty(project, "com.anatawa12.forge.gradle.wrapper-artifact");
+        if (mavenPluginEnabled) {
+            GradleVersionUtils.ifAfter("6.0", () -> {
+                if (project.getGradle().getStartParameter().getWarningMode() == WarningMode.All) {
+                    project.getLogger().warn("The maven plugin is automatically applied by ForgeGradle and " +
+                            "will not be applied since Gradle 7.0. " +
+                            "If you're using maven plugin applied by ForgeGradle, " +
+                            "please use 'maven-publish' instead and apply it yourself.");
+                    project.getLogger().warn("To disable applying maven plugin by ForgeGradle, please set " +
+                            "'com.anatawa12.forge.gradle.no-maven-plugin' project property as 'true' in " +
+                            "gradle.properties.");
+                }
+            });
+            applyExternalPlugin("maven");
+        }
+        this.applyExternalPlugin("idea");
+
+        hasScalaBefore = project.getPlugins().hasPlugin("scala");
+        hasGroovyBefore = project.getPlugins().hasPlugin("groovy");
+
+        addGitIgnore(); //Morons -.-
+
+        configureDeps();
+        configureCompilation();
+        configureIntellij();
+
+        // create basic tasks.
+        tasks();
+
+        // create lifecycle tasks.
+
+        Task task = makeTask("setupCIWorkspace", DefaultTask.class);
+        task.dependsOn("genSrgs", "deobfBinJar");
+        task.setDescription("Sets up the bare minimum to build a minecraft mod. Ideal for CI servers");
+        task.setGroup("ForgeGradle");
+        if (wrapperArtifact) task.dependsOn("genWrapperArtifact");
+        //configureCISetup(task);
+
+        task = makeTask("setupDevWorkspace", DefaultTask.class);
+        task.dependsOn("genSrgs", "deobfBinJar", "makeStart");
+        task.setDescription("CIWorkspace + natives and assets to run and test Minecraft");
+        task.setGroup("ForgeGradle");
+        if (wrapperArtifact) task.dependsOn("genWrapperArtifact");
+        //configureDevSetup(task);
+
+        task = makeTask("setupDecompWorkspace", DefaultTask.class);
+        task.dependsOn("genSrgs", "makeStart", "resolveGeneratedWorkspace");
+        task.setDescription("DevWorkspace + the deobfuscated Minecraft source linked as a source jar.");
+        task.setGroup("ForgeGradle");
+        if (wrapperArtifact) task.dependsOn("genWrapperArtifact");
+
+        makeTask("resolveGeneratedWorkspace", DefaultTask.class).setGroup("ForgeGradle");
+        Task resetGeneratedWorkspaceCache = makeTask("resetGeneratedWorkspaceCache", DefaultTask.class);
+        resetGeneratedWorkspaceCache.setGroup("ForgeGradle");
+        resetGeneratedWorkspaceCache.setDescription("Deletes the Maven cache entry for the current generated Forge workspace fingerprint.");
+        resetGeneratedWorkspaceCache.doLast(resetTask -> {
+            File cacheEntry = generatedWorkspacePom.getParentFile();
+            project.delete(cacheEntry);
+            project.getLogger().lifecycle("Removed generated Forge workspace cache entry {}", cacheEntry);
+        });
+        //configureDecompSetup(task);
+
+        if (isSetupDecompWorkspaceRequested()) {
+            getExtension().setDecomp();
+        }
+    }
+
+    private boolean isSetupDecompWorkspaceRequested() {
+        for (String taskName : project.getGradle().getStartParameter().getTaskNames()) {
+            if ("setupDecompWorkspace".equals(taskName) || taskName.endsWith(":setupDecompWorkspace")) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private boolean isGeneratedWorkspaceCacheResetRequested() {
+        for (String taskName : project.getGradle().getStartParameter().getTaskNames()) {
+            if ("resetGeneratedWorkspaceCache".equals(taskName) || taskName.endsWith(":resetGeneratedWorkspaceCache"))
+                return true;
+        }
+
+        return false;
+    }
+
+    private final Set<String> appliedJsonDependencyConfigurations = new HashSet<>();
+    private final Set<String> appliedJsonNativeConfigurations = new HashSet<>();
+    private boolean hasScalaBefore = false;
+    private boolean hasGroovyBefore = false;
+
+    /**
+     * may not include delayed tokens.
+     *
+     * @return name of API, eg "forge", "fml", "liteloader"
+     */
+    public abstract String getApiName();
+
+    /**
+     * Name of the source dependency.  eg: forgeSrc
+     * may not include delayed tokens.
+     *
+     * @return the name of the recompiled dependency
+     */
+    protected abstract String getSrcDepName();
+
+    /**
+     * Name of the source dependency.  eg: forgeBin
+     * may not include delayed tokens.
+     *
+     * @return the name of the bin-patched dependency
+     */
+    protected abstract String getBinDepName();
+
+    /**
+     * May invoke the extension object, or be hardcoded.
+     * may not include delayed tokens.
+     *
+     * @return has an api version
+     */
+    protected abstract boolean hasApiVersion();
+
+    /**
+     * May invoke the extension object, or be hardcoded.
+     * may not include delayed tokens.
+     *
+     * @param exten the extension object
+     * @return the api version
+     */
+    protected abstract String getApiVersion(T exten);
+
+    /**
+     * May invoke the extension object, or be hardcoded.
+     * may not include delayed tokens.
+     *
+     * @param exten the extension object
+     * @return the MC version
+     */
+    protected abstract String getMcVersion(T exten);
+
+    /**
+     * May invoke the extension object, or be hardcoded.
+     * This unlike the others, is evaluated as a delayed file, and may contain various tokens including:
+     * {API_NAME} {API_VERSION} {MC_VERSION}
+     *
+     * @param exten the extension object
+     * @return the API cache dir
+     */
+    protected abstract String getApiCacheDir(T exten);
+
+    /**
+     * May invoke the extension object, or be hardcoded.
+     * This unlike the others, is evaluated as a delayed file, and may contain various tokens including:
+     * {API_NAME} {API_VERSION} {MC_VERSION}
+     *
+     * @param exten the extension object
+     * @return the SRG cache dir
+     */
+    protected abstract String getSrgCacheDir(T exten);
+
+    /**
+     * May invoke the extension object, or be hardcoded.
+     * This unlike the others, is evaluated as a delayed file, and may contain various tokens including:
+     * {API_NAME} {API_VERSION} {MC_VERSION}
+     *
+     * @param exten the extension object
+     * @return the userdev cache dir
+     */
+    protected abstract String getUserDevCacheDir(T exten);
+
+    /**
+     * This unlike the others, is evaluated as a delayed string, and may contain various tokens including:
+     * {API_NAME} {API_VERSION} {MC_VERSION}
+     *
+     * @return the userdev dep string
+     */
+    protected abstract String getUserDev();
+
+    /**
+     * For run configurations. Is delayed.
+     *
+     * @return the client tweaker class name
+     */
+    protected abstract String getClientTweaker();
+
+    /**
+     * For run configurations. Is delayed.
+     *
+     * @return the server tweaker class name
+     */
+    protected abstract String getServerTweaker();
+
+    /**
+     * For run configurations
+     *
+     * @return the start location
+     */
+    protected abstract String getStartDir();
+
+    /**
+     * For run configurations. Is delayed.
+     *
+     * @return the client main class name
+     */
+    protected abstract String getClientRunClass();
+
+    /**
+     * For run configurations
+     *
+     * @return the client run arguments
+     */
+    protected abstract Iterable<String> getClientRunArgs();
+
+    /**
+     * For run configurations. Is delayed.
+     *
+     * @return the server main class name
+     */
+    protected abstract String getServerRunClass();
+
+    /**
+     * For run configurations
+     *
+     * @return the server run arguments
+     */
+    protected abstract Iterable<String> getServerRunArgs();
+
+//    protected abstract void configureCISetup(Task task);
+//    protected abstract void configureDevSetup(Task task);
+//    protected abstract void configureDecompSetup(Task task);
+
+    @Override
+    public String resolve(String pattern, Project project, T exten) {
+        pattern = super.resolve(pattern, project, exten);
+
+        pattern = pattern.replace("{MCP_DATA_DIR}", CONF_DIR);
+        pattern = pattern.replace("{USER_DEV}", this.getUserDevCacheDir(exten));
+        pattern = pattern.replace("{SRG_DIR}", this.getSrgCacheDir(exten));
+        pattern = pattern.replace("{API_CACHE_DIR}", this.getApiCacheDir(exten));
+        pattern = pattern.replace("{MC_VERSION}", getMcVersion(exten));
+
+        // do run config stuff.
+        pattern = pattern.replace("{RUN_CLIENT_TWEAKER}", getClientTweaker());
+        pattern = pattern.replace("{RUN_SERVER_TWEAKER}", getServerTweaker());
+        pattern = pattern.replace("{RUN_BOUNCE_CLIENT}", getClientRunClass());
+        pattern = pattern.replace("{RUN_BOUNCE_SERVER}", getServerRunClass());
+
+        if (!exten.mappingsSet()) {
+            // no mappings set?remove these tokens
+            pattern = pattern.replace("{MAPPING_CHANNEL}", "");
+            pattern = pattern.replace("{MAPPING_VERSION}", "");
+        }
+
+        if (hasApiVersion())
+            pattern = pattern.replace("{API_VERSION}", getApiVersion(exten));
+
+        pattern = pattern.replace("{API_NAME}", getApiName());
+        return pattern;
+    }
+
+    protected void configureDeps() {
+        // create configs
+        project.getConfigurations().create(CONFIG_USERDEV);
+        project.getConfigurations().create(CONFIG_NATIVES);
+        project.getConfigurations().create(CONFIG_START);
+        project.getConfigurations().create(CONFIG_DEPS);
+        // First-run dependencies from dev.json are populated after extractUserDev.
+        // Keep them out of compileClasspath while IDE tooling queries the model.
+        project.getConfigurations().create(CONFIG_DEPS_SETUP);
+        project.getConfigurations().create(CONFIG_MC);
+
+        // special userDev stuff
+        ExtractConfigTask extractUserDev = makeTask("extractUserDev", ExtractConfigTask.class);
+        extractUserDev.setOut(delayedFile("{USER_DEV}"));
+        extractUserDev.setConfig(CONFIG_USERDEV);
+        extractUserDev.dependsOn("getVersionJson");
+        extractUserDev.doLast(new Action<Task>() {
+            @Override
+            public void execute(Task arg0) {
+                readAndApplyJson(getDevJson().call(), CONFIG_DEPS_SETUP, CONFIG_NATIVES, arg0.getLogger());
+                JavaCompile recompTask = (JavaCompile) project.getTasks().getByName("recompMinecraft");
+                recompTask.setClasspath(project.files(
+                        project.getConfigurations().getByName(CONFIG_DEPS),
+                        project.getConfigurations().getByName(CONFIG_DEPS_SETUP)));
+            }
+        });
+        project.getTasks().findByName("getAssetsIndex").dependsOn("extractUserDev");
+
+        // special native stuff
+        ExtractConfigTask extractNatives = makeTask("extractNatives", ExtractConfigTask.class);
+        extractNatives.setOut(delayedFile(Constants.NATIVES_DIR));
+        extractNatives.setConfig(CONFIG_NATIVES);
+        extractNatives.exclude("META-INF/**", "META-INF/**");
+        extractNatives.dependsOn("extractUserDev");
+
+        // special gradleStart stuff
+        project.getDependencies().add(CONFIG_START, project.files(delayedFile(getStartDir())));
+
+        // extra libs folder.
+        project.getDependencies().add(CONFIG_COMPILE, project.fileTree("libs"));
+
+        // make MC dependencies into normal compile classpath
+        if (!wrapperArtifact)
+            project.getConfigurations().getByName(CONFIG_COMPILE).extendsFrom(project.getConfigurations().getByName(CONFIG_DEPS));
+        project.getConfigurations().getByName(CONFIG_COMPILE).extendsFrom(project.getConfigurations().getByName(CONFIG_MC));
+        project.getConfigurations().getByName(CONFIG_RUNTIME).extendsFrom(project.getConfigurations().getByName(CONFIG_START));
+    }
+
+    /**
+     * This mod adds the API sourceSet, and correctly configures the
+     */
+    protected void configureCompilation() {
+        SourceSetContainer sourceSets = JavaExtensionHelper.getSourceSet(project);
+        SourceSet main = sourceSets.getByName(SourceSet.MAIN_SOURCE_SET_NAME);
+        SourceSet test = sourceSets.getByName(SourceSet.TEST_SOURCE_SET_NAME);
+        SourceSet api = sourceSets.create("api");
+
+        // set the Source
+        JavaExtensionHelper.setSourceCompatibility(project, "1.8");
+        JavaExtensionHelper.setTargetCompatibility(project, "1.8");
+
+        main.setCompileClasspath(main.getCompileClasspath().plus(api.getOutput()));
+        test.setCompileClasspath(test.getCompileClasspath().plus(api.getOutput()));
+
+        String upperConfigCompile = String.valueOf(CONFIG_COMPILE.charAt(0)).toUpperCase(Locale.ROOT) + CONFIG_COMPILE.substring(1);
+        project.getConfigurations().getByName("api" + upperConfigCompile).extendsFrom(project.getConfigurations().getByName(CONFIG_COMPILE));
+        project.getConfigurations().getByName("test" + upperConfigCompile).extendsFrom(project.getConfigurations().getByName("api" + upperConfigCompile));
+
+        // set compile not to take from libs
+        /*
+        JavaCompile compileTask = ((JavaCompile) project.getTasks().getByName(main.getCompileJavaTaskName()));
+        FileCollection sourcePath = compileTask.getOptions().getSourcepath();
+        if (sourcePath == null)
+            sourcePath = project.files(".");
+        else
+            sourcePath = sourcePath.plus(project.files("."));
+        compileTask.getOptions().setSourcepath(sourcePath);
+        // */
+    }
+
+    private void readAndApplyJson(File file, String depConfig, String nativeConfig, Logger log) {
+        if (version == null) {
+            try {
+                version = JsonFactory.loadVersion(file, delayedFile(Constants.JSONS_DIR).call());
+            } catch (JsonSyntaxException | JsonIOException | IOException e) {
+                log.error(file + " could not be parsed");
+                throw new RuntimeException(e);
+            } catch (Throwable t) {
+                Throwables.throwIfUnchecked(t);
+                throw new RuntimeException(t);
+            }
+        }
+
+        // apply the dep info.
+        DependencyHandler handler = project.getDependencies();
+
+        // actual dependencies
+        if (project.getConfigurations().getByName(depConfig).getState() == State.UNRESOLVED &&
+                appliedJsonDependencyConfigurations.add(depConfig)) {
+            for (Library lib : version.getLibraries()) {
+                if (lib.natives == null) {
+                    String artifactName = lib.getArtifactName();
+
+                    // Filter out Scala and Akka libraries if excludeScalaLibs is enabled
+                    if (getExtension().isExcludeScalaLibs()) {
+                        if (artifactName.contains("org.scala-lang") ||
+                            artifactName.contains("com.typesafe.akka") ||
+                            artifactName.contains(":scala-")) {
+                            log.debug("Excluding Scala/Akka library: " + artifactName);
+                            continue;
+                        }
+                    }
+
+                    // Скипаем твич либы, если excludeTwitchLib=true (все равно твич этой версии давно сдох и майн не дохнет без него).
+                    // Однако именно при сетапе воркспейса майнкрафт - всё равно ВКЛЮЧАЕМ эту либу в депенды, иначе генерация исходников
+                    // ванилла майна сдохнет
+                    if (getExtension().isExcludeTwitchLib() && !CONFIG_DEPS.equals(depConfig)) {
+                        if (artifactName.startsWith("tv.twitch:")) {
+                            log.debug("Excluding twitch library: " + artifactName);
+                            continue;
+                        }
+                    }
+
+                    handler.add(depConfig, artifactName);
+                }
+            }
+        } else
+            log.debug("RESOLVED: " + depConfig);
+
+        // the natives
+        if (project.getConfigurations().getByName(nativeConfig).getState() == State.UNRESOLVED &&
+                appliedJsonNativeConfigurations.add(nativeConfig)) {
+            for (Library lib : version.getLibraries()) {
+                if (lib.natives != null)
+                    handler.add(nativeConfig, lib.getArtifactName());
+            }
+        } else
+            log.debug("RESOLVED: " + nativeConfig);
+
+    }
+
+    protected void configureIntellij() {
+        IdeaModel ideaConv = (IdeaModel) project.getExtensions().getByName("idea");
+
+        ideaConv.getModule().getExcludeDirs().addAll(project.files(".gradle", "build", ".idea").getFiles());
+        ideaConv.getModule().setDownloadJavadoc(true);
+        ideaConv.getModule().setDownloadSources(true);
+
+        // fix the idea bug
+        ideaConv.getModule().setInheritOutputDirs(true);
+
+        Task task = makeTask("genIntellijRuns", DefaultTask.class);
+        task.setGroup("ForgeGradle");
+        task.doLast(new Action<Task>() {
+            @Override
+            public void execute(Task task1) {
+                try {
+                    String module = task1.getProject().getProjectDir().getCanonicalPath();
+
+                    File root = task1.getProject().getProjectDir().getCanonicalFile();
+                    File file = null;
+                    while (file == null && !root.equals(task1.getProject().getRootProject().getProjectDir().getCanonicalFile().getParentFile())) {
+                        file = new File(root, ".idea/workspace.xml");
+                        if (!file.exists()) {
+                            file = null;
+                            // find iws file
+                            for (File f : root.listFiles()) {
+                                if (f.isFile() && f.getName().endsWith(".iws")) {
+                                    file = f;
+                                    break;
+                                }
+                            }
+                        }
+
+                        root = root.getParentFile();
+                    }
+
+                    if (file == null || !file.exists())
+                        throw new RuntimeException("Intellij workspace file could not be found! are you sure you imported the project into intellij?");
+
+                    DocumentBuilderFactory docFactory = DocumentBuilderFactory.newInstance();
+                    DocumentBuilder docBuilder = docFactory.newDocumentBuilder();
+                    Document doc = docBuilder.parse(file);
+
+                    injectIntellijRuns(doc, module);
+
+                    // write the content into xml file
+                    TransformerFactory transformerFactory = TransformerFactory.newInstance();
+                    Transformer transformer = transformerFactory.newTransformer();
+                    transformer.setOutputProperty(OutputKeys.OMIT_XML_DECLARATION, "no");
+                    transformer.setOutputProperty(OutputKeys.METHOD, "xml");
+                    transformer.setOutputProperty(OutputKeys.INDENT, "yes");
+                    transformer.setOutputProperty(OutputKeys.ENCODING, StandardCharsets.UTF_8.name());
+                    //noinspection HttpUrlsUsage
+                    transformer.setOutputProperty("{http://xml.apache.org/xslt}indent-amount", "4");
+
+                    DOMSource source = new DOMSource(doc);
+                    StreamResult result = new StreamResult(file);
+                    //StreamResult result = new StreamResult(System.out);
+
+                    transformer.transform(source, result);
+                } catch (Exception e) {
+                    e.printStackTrace();
+                }
+            }
+        });
+
+        if (ideaConv.getWorkspace().getIws() == null)
+            return;
+
+        ideaConv.getWorkspace().getIws().withXml(new Action<XmlProvider>() {
+            @Override
+            public void execute(XmlProvider xmlProvider) {
+                Element root = xmlProvider.asElement();
+                Document doc = root.getOwnerDocument();
+                try {
+                    injectIntellijRuns(doc, project.getProjectDir().getCanonicalPath());
+                } catch (Exception e) {
+                    e.printStackTrace();
+                }
+            }
+        });
+    }
+
+    public final void injectIntellijRuns(Document doc, String module) throws DOMException, IOException {
+        Element root = null;
+
+        {
+            NodeList list = doc.getElementsByTagName("component");
+            for (int i = 0; i < list.getLength(); i++) {
+                Element e = (Element) list.item(i);
+                if ("RunManager".equals(e.getAttribute("name"))) {
+                    root = e;
+                    break;
+                }
+            }
+        }
+
+        // Создать RunManager компонент если его нет
+        if (root == null) {
+            root = doc.createElement("component");
+            root.setAttribute("name", "RunManager");
+            root.setAttribute("selected", "Application.Minecraft Client");
+            doc.getDocumentElement().appendChild(root);
+        }
+
+        String[][] config = new String[][]
+                {
+                        new String[]
+                                {
+                                        "Minecraft Client",
+                                        GRADLE_START_CLIENT,
+                                        getExtension().getClientJvmArgs().isEmpty()
+                                            ? "-Xmx2048M -Xms1024M"
+                                            : String.join(" ", getExtension().getClientJvmArgs()),
+                                        String.join(" ", getClientRunArgs())
+                                },
+                        new String[]
+                                {
+                                        "Minecraft Server",
+                                        GRADLE_START_SERVER,
+                                        getExtension().getServerJvmArgs().isEmpty()
+                                            ? "-Dfml.ignoreInvalidMinecraftCertificates=true"
+                                            : String.join(" ", getExtension().getServerJvmArgs()),
+                                        String.join(" ", getServerRunArgs())
+                                }
+                };
+
+        for (String[] data : config) {
+            Element child = add(root, "configuration",
+                    "default", "false",
+                    "name", data[0],
+                    "type", "Application",
+                    "factoryName", "Application",
+                    "default", "false");
+
+            add(child, "extension",
+                    "name", "coverage",
+                    "enabled", "false",
+                    "sample_coverage", "true",
+                    "runner", "idea");
+            add(child, "option", "name", "MAIN_CLASS_NAME", "value", data[1]);
+            add(child, "option", "name", "VM_PARAMETERS", "value", data[2]);
+            add(child, "option", "name", "PROGRAM_PARAMETERS", "value", data[3]);
+            add(child, "option", "name", "WORKING_DIRECTORY", "value", "file://" + delayedFile("{RUN_DIR}").call().getCanonicalPath().replace(module, "$PROJECT_DIR$"));
+            add(child, "option", "name", "ALTERNATIVE_JRE_PATH_ENABLED", "value", "true");
+            //Увы, IDEA не позволяет задать 1.8 / 8 / jdk8 или чет такое, потому привязка к вендору
+            //В любом случае после генерации тасков ее можно поменять на ту jdk, которая есть на ПК
+            add(child, "option", "name", "ALTERNATIVE_JRE_PATH", "value", "liberica-1.8");
+            add(child, "option", "name", "ENABLE_SWING_INSPECTOR", "value", "false");
+            add(child, "option", "name", "ENV_VARIABLES");
+            add(child, "option", "name", "PASS_PARENT_ENVS", "value", "true");
+            String moduleName = ((IdeaModel) project.getExtensions().getByName("idea")).getModule().getName();
+            // IDEA заменяет точки на подчеркивания в именах модулей
+            String ideaModuleName = moduleName.replace(".", "_");
+            add(child, "module", "name", ideaModuleName + ".main");
+            add(child, "envs");
+            add(child, "RunnerSettings", "RunnerId", "Run");
+            add(child, "ConfigurationWrapper", "RunnerId", "Run");
+            add(child, "method");
+        }
+        File f = delayedFile("{RUN_DIR}").call();
+        if (!f.exists())
+            f.mkdirs();
+    }
+
+    private Element add(Element parent, String name, String... values) {
+        Element e = parent.getOwnerDocument().createElement(name);
+        for (int x = 0; x < values.length; x += 2) {
+            e.setAttribute(values[x], values[x + 1]);
+        }
+        parent.appendChild(e);
+        return e;
+    }
+
+    private void tasks() {
+        {
+            GenSrgTask task = makeTask("genSrgs", GenSrgTask.class);
+            task.setInSrg(delayedFile(PACKAGED_SRG));
+            task.setInExc(delayedFile(PACKAGED_EXC));
+            task.setMethodsCsv(delayedFile(METHOD_CSV));
+            task.setFieldsCsv(delayedFile(FIELD_CSV));
+            task.setNotchToSrg(delayedFile(DEOBF_SRG_SRG));
+            task.setNotchToMcp(delayedFile(DEOBF_MCP_SRG));
+            task.setSrgToMcp(delayedFile(DEOBF_SRG_MCP_SRG));
+            task.setMcpToSrg(delayedFile(REOBF_SRG));
+            task.setMcpToNotch(delayedFile(REOBF_NOTCH_SRG));
+            task.setSrgExc(delayedFile(EXC_SRG));
+            task.setMcpExc(delayedFile(EXC_MCP));
+            task.dependsOn("extractUserDev", "extractMcpData");
+        }
+
+        if (wrapperArtifact) {
+            GenWrapperArtifactTask task = makeTask("genWrapperArtifact", GenWrapperArtifactTask.class);
+            task.setIvyXml(delayedDirtyFile("wrapper-of-{API_NAME}", "ivy", "xml"));
+            task.setEmptyJar(delayedDirtyFile("wrapper-of-{API_NAME}", "ivy", "jar"));
+            task.setModuleName(delayedString("{API_NAME}"));
+            task.setIsDecomp(() -> getExtension().isDecomp());
+            task.setSrcDepName(getSrcDepName());
+            task.setBinDepName(getBinDepName());
+            task.setVersion(delayedString(hasApiVersion() ? "{API_VERSION}" : "{MC_VERSION}"));
+            task.setConfiguration(project.getConfigurations().getByName(CONFIG_DEPS));
+        }
+
+        {
+            MergeJarsTask task = makeTask("mergeJars", MergeJarsTask.class);
+            task.setClient(delayedFile(JAR_CLIENT_FRESH));
+            task.setServer(delayedFile(JAR_SERVER_FRESH));
+            task.setOutJar(delayedFile(JAR_MERGED));
+            task.setMergeCfg(delayedFile(MERGE_CFG));
+            task.setMcVersion(delayedString("{MC_VERSION}"));
+            task.dependsOn("extractUserDev", "downloadClient", "downloadServer");
+        }
+
+        {
+            String name = getBinDepName() + "-" + (hasApiVersion() ? "{API_VERSION}" : "{MC_VERSION}") + ".jar";
+
+            ProcessJarTask task = makeTask("deobfBinJar", ProcessJarTask.class);
+            task.setSrg(delayedFile(DEOBF_MCP_SRG));
+            task.setExceptorJson(delayedFile(EXC_JSON));
+            task.setExceptorCfg(delayedFile(EXC_MCP));
+            task.setFieldCsv(delayedFile(FIELD_CSV));
+            task.setMethodCsv(delayedFile(METHOD_CSV));
+            task.setInJar(delayedFile(JAR_MERGED));
+            task.setOutCleanJar(delayedFile("{API_CACHE_DIR}/" + MAPPING_APPENDAGE + name));
+            task.setOutDirtyJar(delayedFile(DIRTY_DIR + "/" + name));
+            task.setApplyMarkers(false);
+            task.setStripSynthetics(true);
+            configureDeobfuscation(task);
+            task.dependsOn("downloadMcpTools", "mergeJars", "genSrgs");
+            if (wrapperArtifact) task.dependsOn("genWrapperArtifact");
+        }
+
+        {
+            String name = "{API_NAME}-" + (hasApiVersion() ? "{API_VERSION}" : "{MC_VERSION}") + "-" + CLASSIFIER_DEOBF_SRG + ".jar";
+
+            ProcessJarTask task = makeTask("deobfuscateJar", ProcessJarTask.class);
+            task.setSrg(delayedFile(DEOBF_SRG_SRG));
+            task.setExceptorJson(delayedFile(EXC_JSON));
+            task.setExceptorCfg(delayedFile(EXC_SRG));
+            task.setInJar(delayedFile(JAR_MERGED));
+            task.setOutCleanJar(delayedFile("{API_CACHE_DIR}/" + name));
+            task.setOutDirtyJar(delayedFile(DIRTY_DIR + "/" + name));
+            task.setApplyMarkers(true);
+            configureDeobfuscation(task);
+            task.dependsOn("downloadMcpTools", "mergeJars", "genSrgs");
+        }
+
+        {
+            ReobfTask task = makeTask("reobf", ReobfTask.class);
+            task.dependsOn("genSrgs");
+            task.setExceptorCfg(delayedFile(EXC_SRG));
+            task.setSrg(delayedFile(REOBF_SRG));
+            task.setFieldCsv(delayedFile(FIELD_CSV));
+            task.setMethodCsv(delayedFile(METHOD_CSV));
+            task.setMcVersion(delayedString("{MC_VERSION}"));
+
+            task.mustRunAfter("test");
+            task.mustRunAfter("repackMinecraft");
+            project.getTasks().getByName("assemble").dependsOn(task);
+            if (mavenPluginEnabled)
+                project.getTasks().getByName("uploadArchives").dependsOn(task);
+        }
+
+        {
+            // create GradleStart
+            CreateStartTask task = makeTask("makeStart", CreateStartTask.class);
+            task.addResource("GradleStart.java");
+            task.addResource("GradleStartServer.java");
+            task.addResource("net/minecraftforge/gradle/GradleStartCommon.java");
+            task.addResource("net/minecraftforge/gradle/OldPropertyMapSerializer.java");
+            task.addResource("net/minecraftforge/gradle/tweakers/CoremodTweaker.java");
+            task.addResource("net/minecraftforge/gradle/tweakers/AccessTransformerTweaker.java");
+            task.addReplacement("@@MCVERSION@@", delayedString("{MC_VERSION}"));
+            task.addReplacement("@@ASSETINDEX@@", delayedString("{ASSET_INDEX}"));
+            task.addReplacement("@@ASSETSDIR@@", delayedFile("{CACHE_DIR}/minecraft/assets"));
+            task.addReplacement("@@NATIVESDIR@@", delayedFile(Constants.NATIVES_DIR));
+            task.addReplacement("@@SRGDIR@@", delayedFile("{SRG_DIR}"));
+            task.addReplacement("@@SRG_NOTCH_SRG@@", delayedFile(UserConstants.DEOBF_SRG_SRG));
+            task.addReplacement("@@SRG_NOTCH_MCP@@", delayedFile(UserConstants.DEOBF_MCP_SRG));
+            task.addReplacement("@@SRG_SRG_MCP@@", delayedFile(UserConstants.DEOBF_SRG_MCP_SRG));
+            task.addReplacement("@@SRG_MCP_SRG@@", delayedFile(UserConstants.REOBF_SRG));
+            task.addReplacement("@@SRG_MCP_NOTCH@@", delayedFile(UserConstants.REOBF_NOTCH_SRG));
+            task.addReplacement("@@CSVDIR@@", delayedFile("{MCP_DATA_DIR}"));
+            task.addReplacement("@@CLIENTTWEAKER@@", delayedString("{RUN_CLIENT_TWEAKER}"));
+            task.addReplacement("@@SERVERTWEAKER@@", delayedString("{RUN_SERVER_TWEAKER}"));
+            task.addReplacement("@@BOUNCERCLIENT@@", delayedString("{RUN_BOUNCE_CLIENT}"));
+            task.addReplacement("@@BOUNCERSERVER@@", delayedString("{RUN_BOUNCE_SERVER}"));
+            task.setStartOut(delayedFile(getStartDir()));
+            task.compileResources(CONFIG_DEPS);
+
+            // see delayed task config for some more config
+
+            task.dependsOn("extractUserDev", "getAssets", "getAssetsIndex", "extractNatives");
+        }
+
+        createPostDecompTasks();
+        createExecTasks();
+        createSourceCopyTasks();
+    }
+
+    private void createPostDecompTasks() {
+        DelayedFile decompOut = delayedDirtyFile(null, CLASSIFIER_DECOMPILED, "jar", false);
+        DelayedFile remapped = generatedWorkspaceArtifactDelayed(CLASSIFIER_SOURCES);
+        final DelayedFile recomp = generatedWorkspaceArtifactDelayed(null);
+        final DelayedFile recompSrc = delayedFile(RECOMP_SRC_DIR);
+        final DelayedFile recompCls = delayedFile(RECOMP_CLS_DIR);
+
+        DecompileTask decomp = makeTask("decompile", DecompileTask.class);
+        {
+            decomp.setInJar(delayedDirtyFile(null, CLASSIFIER_DEOBF_SRG, "jar", false));
+            decomp.setOutJar(decompOut);
+            decomp.setFernFlower(delayedFile(FERNFLOWER));
+            decomp.setPatch(delayedFile(MCP_PATCH_DIR));
+            decomp.setAstyleConfig(delayedFile(ASTYLE_CFG));
+            decomp.dependsOn("downloadMcpTools", "deobfuscateJar", "genSrgs");
+        }
+
+        // Remap to MCP names
+        RemapSourcesTask remap = makeTask("remapJar", RemapSourcesTask.class);
+        {
+            remap.setInJar(decompOut);
+            remap.setOutJar(remapped);
+            remap.setFieldsCsv(delayedFile(FIELD_CSV));
+            remap.setMethodsCsv(delayedFile(METHOD_CSV));
+            remap.setParamsCsv(delayedFile(PARAM_CSV));
+            remap.setDoesJavadocs(true);
+            remap.dependsOn(decomp);
+        }
+
+        Spec<? super Task> onlyIfCheck = task -> {
+            TaskDependency dependency = task.getTaskDependencies();
+            boolean didWork = false;
+            for (Task depTask : dependency.getDependencies(task)) {
+                if (depTask.getDidWork()) {
+                    didWork = true;
+                    break;
+                }
+            }
+            boolean completeArtifactPair = isValidArchive(recomp.call()) && isValidArchive(remapped.call());
+            if (!completeArtifactPair)
+                return true;
+            else
+                return didWork;
+        };
+
+        ExtractTask extract = makeTask("extractMinecraftSrc", ExtractTask.class);
+        {
+            extract.from(remapped);
+            extract.into(recompSrc);
+            extract.setIncludeEmptyDirs(false);
+            extract.setClean(true);
+            extract.dependsOn(remap);
+
+            extract.onlyIf(onlyIfCheck);
+        }
+
+        JavaCompile recompTask = makeTask("recompMinecraft", JavaCompile.class);
+        {
+            recompTask.setSource(recompSrc);
+            //ВНИМАНИЕ: После сборки майнкрафта с патчами в IDE - StackMapTable НЕ посчитан!
+            //Потому если классы собрать под java7 и выше - произойдет краш верификации байткода.
+            //JVM допускает отсутствие StackMapTable, но только если класс собран под java6 или ниже.
+            //Оригинальный ForgeGradle тоже здесь ставит java6. НИ В КОЕМ СЛУЧАЕ НЕ МЕНЯТЬ на java7/8!!!
+            recompTask.setSourceCompatibility("1.6");
+            recompTask.setTargetCompatibility("1.6");
+            try {
+                JavaToolchainService toolchains = project.getExtensions().getByType(JavaToolchainService.class);
+                recompTask.getJavaCompiler().set(
+                        toolchains.compilerFor(spec -> spec.getLanguageVersion().set(JavaLanguageVersion.of(8))));
+            } catch (Throwable t) {
+                project.getLogger().error("Unsupported gradle version {}", project.getGradle().getGradleVersion(), t);
+            }
+            // extractUserDev has populated it; its classpath is set in that task.
+            recompTask.setClasspath(project.getConfigurations().getByName(CONFIG_DEPS));
+            recompTask.dependsOn(extract);
+            recompTask.getOptions().setWarnings(false);
+
+            recompTask.onlyIf(onlyIfCheck);
+        }
+
+        Jar repackageTask = makeTask("repackMinecraft", Jar.class);
+        {
+            repackageTask.from(recompSrc);
+            repackageTask.from(recompCls);
+            repackageTask.exclude("*.java", "**/*.java", "**.java");
+            repackageTask.dependsOn(recompTask);
+
+            // file output configuration done in the delayed configuration.
+
+            repackageTask.onlyIf(onlyIfCheck);
+        }
+
+        configureGeneratedSourcesPublication();
+    }
+
+    private void configureGeneratedSourcesPublication() {
+        project.afterEvaluate(ignored -> {
+            //После публикации в maven local sources jar получает 600 posix права, из-за чего IDE не может прочитать файл
+            //Исправляем пермишены после публикации для корреткной работы на Unix
+            Task normalizePermissions = project.getTasks().create("normalizeGeneratedWorkspacePermissions", DefaultTask.class);
+            normalizePermissions.doLast(task -> {
+                for (File artifact : new File[] {
+                        generatedWorkspaceArtifact(null),
+                        generatedWorkspaceArtifact(CLASSIFIER_SOURCES)
+                }) {
+                    if (artifact.isFile() && !artifact.setReadable(true, false))
+                        throw new GradleException("Could not make generated Forge artifact readable: " + artifact);
+                }
+            });
+            project.getTasks().getByName("setupDecompWorkspace").finalizedBy(normalizePermissions);
+
+            if (generatedWorkspaceCacheHit)
+                return;
+
+            Task writePom = project.getTasks().create("writeGeneratedWorkspacePom", DefaultTask.class);
+            writePom.dependsOn("repackMinecraft");
+            writePom.doLast(task -> {
+                generatedWorkspacePom.getParentFile().mkdirs();
+                String contents = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n" +
+                        "<project xmlns=\"http://maven.apache.org/POM/4.0.0\" xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\" xsi:schemaLocation=\"http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd\">\n" +
+                        "  <modelVersion>4.0.0</modelVersion>\n" +
+                        "  <groupId>net.minecraftforge.generated</groupId>\n" +
+                        "  <artifactId>" + getSrcDepName() + "</artifactId>\n" +
+                        "  <version>" + generatedWorkspaceVersion + "</version>\n" +
+                        "  <packaging>jar</packaging>\n" +
+                        "</project>\n";
+                File temporary = new File(generatedWorkspacePom.getParentFile(), generatedWorkspacePom.getName() + ".tmp");
+                try {
+                    Files.write(temporary.toPath(), contents.getBytes(StandardCharsets.UTF_8));
+                    try {
+                        Files.move(temporary.toPath(), generatedWorkspacePom.toPath(), StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
+                    } catch (IOException atomicMoveUnsupported) {
+                        Files.move(temporary.toPath(), generatedWorkspacePom.toPath(), StandardCopyOption.REPLACE_EXISTING);
+                    }
+                } catch (IOException e) {
+                    throw new GradleException("Could not write generated Forge workspace POM: " + generatedWorkspacePom, e);
+                }
+            });
+            Delete cleanup = project.getTasks().create("cleanupGeneratedWorkspaceIntermediates", Delete.class);
+            //Удаляем srg/decomp/etc файлы после публикации в мавен, не храним мёртвый груз
+            cleanup.delete(delayedFile(RECOMP_SRC_DIR), delayedFile(RECOMP_CLS_DIR));
+            cleanup.delete(generatedWorkspaceIntermediates().toArray());
+            cleanup.onlyIf(task -> isValidArchive(generatedWorkspaceArtifact(null)) &&
+                    isValidArchive(generatedWorkspaceArtifact(CLASSIFIER_SOURCES)));
+            writePom.finalizedBy(cleanup);
+            project.getTasks().getByName("setupDecompWorkspace").finalizedBy(writePom);
+        });
+    }
+
+    private List<File> generatedWorkspaceIntermediates() {
+        File dirtyDir = delayedFile(DIRTY_DIR).call().getAbsoluteFile();
+        List<File> intermediates = new ArrayList<>();
+
+        Task decompile = project.getTasks().findByName("decompile");
+        if (decompile instanceof DecompileTask)
+            addWorkspaceIntermediate(intermediates, dirtyDir, ((DecompileTask) decompile).getOutJar());
+
+        Task deobfuscateJar = project.getTasks().findByName("deobfuscateJar");
+        if (deobfuscateJar instanceof ProcessJarTask) {
+            // Не удаляем srg-jar: reobf ссылается на него как на deobfFile
+            File dirtyOut = ((ProcessJarTask) deobfuscateJar).getOutDirtyJar();
+            if (dirtyOut != null && !dirtyOut.getName().toLowerCase().contains("srg"))
+                addWorkspaceIntermediate(intermediates, dirtyDir, dirtyOut);
+        }
+
+        Task processSources = project.getTasks().findByName("processSources");
+        if (processSources instanceof EditJarTask)
+            addWorkspaceIntermediate(intermediates, dirtyDir, ((EditJarTask) processSources).getOutJar());
+
+        return intermediates;
+    }
+
+    private void addWorkspaceIntermediate(List<File> intermediates, File dirtyDir, File jar) {
+        if (jar == null || !jar.getAbsoluteFile().toPath().normalize().startsWith(dirtyDir.toPath().normalize()))
+            return;
+        intermediates.add(jar);
+        intermediates.add(new File(jar.getParentFile(), jar.getName() + ".md5"));
+    }
+
+    private DelayedFile generatedWorkspaceArtifactDelayed(String classifier) {
+        return new DelayedFile(project, "") {
+            @Override
+            public File resolveDelayed() {
+                return generatedWorkspaceArtifact(classifier);
+            }
+        };
+    }
+
+    private File generatedWorkspaceArtifact(String classifier) {
+        String filename = getSrcDepName() + "-" + generatedWorkspaceVersion +
+                (Strings.isNullOrEmpty(classifier) ? "" : "-" + classifier) + ".jar";
+        return new File(generatedWorkspacePom.getParentFile(), filename);
+    }
+
+    private void prepareGeneratedWorkspaceCache() {
+        try {
+            TreeMap<String, String> inputs = new TreeMap<>();
+            inputs.put("schema", "fg-workspace-cache-v2");
+            String implementationVersion = getClass().getPackage().getImplementationVersion();
+            inputs.put("plugin", implementationVersion == null ? "unversioned" : implementationVersion);
+            inputs.put("plugin-code", hashPluginCode());
+            inputs.put("minecraft", getMcVersion(getExtension()));
+            inputs.put("forge", hasApiVersion() ? getApiVersion(getExtension()) : getMcVersion(getExtension()));
+            inputs.put("mappings", getExtension().getMappings());
+            inputs.put("mcp-version", getExtension().getMcpVersion());
+            inputs.put("java-runtime", System.getProperty("java.runtime.version", System.getProperty("java.version", "unknown")));
+            inputs.put("exclude-scala-libs", Boolean.toString(getExtension().isExcludeScalaLibs()));
+            inputs.put("exclude-twitch-lib", Boolean.toString(getExtension().isExcludeTwitchLib()));
+            int srgIndex = 0;
+            for (String extraSrg : getExtension().getSrgExtra())
+                inputs.put("extra-srg-" + srgIndex++, extraSrg);
+            inputs.put("mcp-data", hashConfigurationFiles(CONFIG_MCP_DATA));
+            primeUserDevDescriptor();
+            readAndApplyJson(getDevJson().call(), CONFIG_DEPS, CONFIG_NATIVES, project.getLogger());
+            readAndApplyJson(getDevJson().call(), CONFIG_DEPS_SETUP, CONFIG_NATIVES, project.getLogger());
+            inputs.put("decompiler", Constants.MCP_URL);
+
+            if (getExtension() instanceof net.minecraftforge.gradle.user.patch.UserPatchExtension) {
+                net.minecraftforge.gradle.user.patch.UserPatchExtension patchExtension =
+                        (net.minecraftforge.gradle.user.patch.UserPatchExtension) getExtension();
+                inputs.put("patch-max-fuzz", Integer.toString(patchExtension.getMaxFuzz()));
+                inputs.put("use-dependency-ats", Boolean.toString(patchExtension.getUseAtFromDependencies()));
+                int index = 0;
+                for (Object configuredAt : patchExtension.getAccessTransformers()) {
+                    Object resolved = configuredAt instanceof Closure ? ((Closure<?>) configuredAt).call() : configuredAt;
+                    addFingerprintFile(inputs, "extension-at-" + index++, project.file(resolved));
+                }
+            }
+
+            addSourceSetAccessTransformers(inputs, "main");
+            addSourceSetAccessTransformers(inputs, "api");
+            if (getExtension() instanceof net.minecraftforge.gradle.user.patch.UserPatchExtension &&
+                    ((net.minecraftforge.gradle.user.patch.UserPatchExtension) getExtension()).getUseAtFromDependencies())
+                addDependencyAccessTransformers(inputs);
+
+            StringBuilder manifest = new StringBuilder();
+            for (Map.Entry<String, String> entry : inputs.entrySet())
+                manifest.append(entry.getKey()).append('=').append(entry.getValue()).append('\n');
+            generatedWorkspaceFingerprint = sha256(manifest.toString().getBytes(StandardCharsets.UTF_8));
+            String baseVersion = hasApiVersion() ? getApiVersion(getExtension()) : getMcVersion(getExtension());
+            generatedWorkspaceVersion = baseVersion + "-fg" + generatedWorkspaceFingerprint;
+
+            File versionDir = new File(new File(new File(generatedWorkspaceRepository, "net/minecraftforge/generated"), getSrcDepName()), generatedWorkspaceVersion);
+            generatedWorkspacePom = new File(versionDir, getSrcDepName() + "-" + generatedWorkspaceVersion + ".pom");
+            boolean resetRequested = isGeneratedWorkspaceCacheResetRequested();
+            generatedWorkspaceCacheHit = !resetRequested && generatedWorkspacePom.isFile() &&
+                    isValidArchive(generatedWorkspaceArtifact(null)) &&
+                    isValidArchive(generatedWorkspaceArtifact(CLASSIFIER_SOURCES));
+            project.getLogger().lifecycle("Forge workspace fingerprint {}: {}",
+                    generatedWorkspaceFingerprint, generatedWorkspaceCacheHit ? "Maven cache hit" : "cache miss");
+
+            if (!generatedWorkspaceCacheHit && isSetupDecompWorkspaceRequested()) {
+                Task resolve = project.getTasks().getByName("resolveGeneratedWorkspace");
+                resolve.dependsOn("repackMinecraft");
+                if (resetRequested) {
+                    resolve.dependsOn("resetGeneratedWorkspaceCache");
+                    project.getTasks().getByName("repackMinecraft").mustRunAfter("resetGeneratedWorkspaceCache");
+                }
+            } else if (generatedWorkspaceCacheHit && isSetupDecompWorkspaceRequested()) {
+                project.getLogger().lifecycle("Skipping decompile/recompile; matching immutable Maven artifacts exist.");
+            }
+        } catch (IOException | NoSuchAlgorithmException | URISyntaxException e) {
+            throw new GradleException("Could not compute generated Forge workspace fingerprint", e);
+        }
+    }
+
+    private String hashPluginCode() throws IOException, NoSuchAlgorithmException, URISyntaxException {
+        File codeSource = new File(getClass().getProtectionDomain().getCodeSource().getLocation().toURI());
+        if (codeSource.isFile())
+            return sha256(codeSource);
+        String classResource = "/" + getClass().getName().replace('.', '/') + ".class";
+        try (java.io.InputStream stream = getClass().getResourceAsStream(classResource)) {
+            return stream == null ? "unavailable" : sha256(stream);
+        }
+    }
+
+    private boolean isValidArchive(File archive) {
+        if (!archive.isFile())
+            return false;
+        try (ZipFile zip = new ZipFile(archive)) {
+            return zip.entries().hasMoreElements();
+        } catch (IOException invalidArchive) {
+            return false;
+        }
+    }
+
+    private void addSourceSetAccessTransformers(Map<String, String> inputs, String sourceSetName)
+            throws IOException, NoSuchAlgorithmException {
+        SourceSet sourceSet = JavaExtensionHelper.getSourceSet(project).findByName(sourceSetName);
+        if (sourceSet == null)
+            return;
+        List<File> transformers = new ArrayList<>();
+        for (File file : sourceSet.getResources().getFiles()) {
+            if (file.isFile() && file.getName().toLowerCase(Locale.ROOT).endsWith("_at.cfg"))
+                transformers.add(file);
+        }
+        List<String> transformerHashes = new ArrayList<>();
+        for (File transformer : transformers)
+            transformerHashes.add(sha256(transformer));
+        Collections.sort(transformerHashes);
+        for (int index = 0; index < transformerHashes.size(); index++)
+            inputs.put(sourceSetName + "-resource-at-" + index, transformerHashes.get(index));
+    }
+
+    private void addDependencyAccessTransformers(Map<String, String> inputs) throws IOException, NoSuchAlgorithmException {
+        org.gradle.api.artifacts.Configuration compileClasspath = project.getConfigurations().findByName("compileClasspath");
+        if (compileClasspath == null)
+            return;
+        org.gradle.api.artifacts.Configuration fingerprintClasspath = compileClasspath.copyRecursive();
+        fingerprintClasspath.setCanBeResolved(true);
+        List<File> jars = new ArrayList<>(fingerprintClasspath.getFiles());
+        List<String> transformerHashes = new ArrayList<>();
+        for (File jar : jars) {
+            if (!jar.isFile() || !jar.getName().endsWith(".jar"))
+                continue;
+            try (ZipFile zip = new ZipFile(jar)) {
+                List<? extends ZipEntry> entries = Collections.list(zip.entries());
+                entries.sort((left, right) -> left.getName().compareTo(right.getName()));
+                for (ZipEntry entry : entries) {
+                    if (entry.isDirectory() || !entry.getName().toLowerCase(Locale.ROOT).endsWith("_at.cfg"))
+                        continue;
+                    try (java.io.InputStream stream = zip.getInputStream(entry)) {
+                        transformerHashes.add(sha256(stream));
+                    }
+                }
+            }
+        }
+        Collections.sort(transformerHashes);
+        for (int index = 0; index < transformerHashes.size(); index++)
+            inputs.put("dependency-at-" + index, transformerHashes.get(index));
+    }
+
+    private String hashConfigurationFiles(String configurationName) throws IOException, NoSuchAlgorithmException {
+        org.gradle.api.artifacts.Configuration configuration = project.getConfigurations().findByName(configurationName);
+        if (configuration == null)
+            return "absent";
+        return hashFiles(configuration.getFiles());
+    }
+
+    private String hashFiles(Collection<File> inputFiles) throws IOException, NoSuchAlgorithmException {
+        List<File> files = new ArrayList<>(inputFiles);
+        Collections.sort(files, (left, right) -> left.getName().compareTo(right.getName()));
+        StringBuilder hashes = new StringBuilder();
+        for (File file : files)
+            hashes.append(file.getName()).append(':').append(sha256(file)).append('\n');
+        return sha256(hashes.toString().getBytes(StandardCharsets.UTF_8));
+    }
+
+    private void primeUserDevDescriptor() throws IOException {
+        File descriptor = getDevJson().call();
+        if (descriptor.isFile())
+            return;
+        org.gradle.api.artifacts.Configuration userdev = project.getConfigurations().getByName(CONFIG_USERDEV);
+        for (File archive : userdev.getFiles()) {
+            if (!archive.isFile())
+                continue;
+            try (ZipFile zip = new ZipFile(archive)) {
+                ZipEntry entry = zip.getEntry("dev.json");
+                if (entry == null)
+                    continue;
+                descriptor.getParentFile().mkdirs();
+                try (java.io.InputStream stream = zip.getInputStream(entry)) {
+                    Files.copy(stream, descriptor.toPath(), StandardCopyOption.REPLACE_EXISTING);
+                }
+                project.getLogger().debug("Read dev.json from resolved userdev archive before workspace task configuration.");
+                return;
+            }
+        }
+        throw new GradleException("Resolved userdev archive does not contain dev.json; cannot configure workspace dependencies safely.");
+    }
+
+    private void addFingerprintFile(Map<String, String> inputs, String key, File file)
+            throws IOException, NoSuchAlgorithmException {
+        inputs.put(key, file.isFile() ? sha256(file) : "missing:" + file.getPath());
+    }
+
+    private String sha256(File file) throws IOException, NoSuchAlgorithmException {
+        try (FileInputStream stream = new FileInputStream(file)) {
+            return sha256(stream);
+        }
+    }
+
+    private String sha256(java.io.InputStream stream) throws IOException, NoSuchAlgorithmException {
+        MessageDigest digest = MessageDigest.getInstance("SHA-256");
+        byte[] buffer = new byte[65536];
+        int read;
+        while ((read = stream.read(buffer)) != -1)
+            digest.update(buffer, 0, read);
+        return toHex(digest.digest());
+    }
+
+    private String sha256(byte[] bytes) throws NoSuchAlgorithmException {
+        return toHex(MessageDigest.getInstance("SHA-256").digest(bytes));
+    }
+
+    private String toHex(byte[] bytes) {
+        StringBuilder result = new StringBuilder(bytes.length * 2);
+        for (byte value : bytes)
+            result.append(String.format(Locale.ROOT, "%02x", value & 0xff));
+        return result.toString();
+    }
+
+    @SuppressWarnings("serial")
+    private class MakeDirExist extends Closure<Boolean> {
+        DelayedFile path;
+
+        MakeDirExist(DelayedFile path) {
+            super(project);
+            this.path = path;
+        }
+
+        @Override
+        public Boolean call() {
+            File f = path.call();
+            if (!f.exists())
+                f.mkdirs();
+            return true;
+        }
+    }
+
+    private void createExecTasks() {
+        // In gradle 4.2 or newer, workingDir be resolved immediately. So set workingDir in afterEvaluate.
+        {
+            final JavaExec exec = makeTask("runClient", JavaExec.class);
+            requireJava8(exec);
+            project.afterEvaluate(project -> exec.workingDir(delayedFile("{RUN_DIR}")));
+            exec.doFirst(new MakeDirExist(delayedFile("{RUN_DIR}")));
+            JavaExecSpecHelper.setMainClass(exec, GRADLE_START_CLIENT);
+            String[] jvmArgs = getExtension().getClientJvmArgs().isEmpty()
+                    ? new String[0] : getExtension().getClientJvmArgs().toArray(new String[0]);
+            exec.jvmArgs((Object[]) jvmArgs);
+            exec.args(getClientRunArgs());
+            exec.setStandardOutput(System.out);
+            exec.setErrorOutput(System.err);
+
+            exec.setGroup("ForgeGradle");
+            exec.setDescription("Runs the Minecraft client");
+
+            exec.dependsOn("makeStart");
+            project.getTasks().getByPath("reobf").mustRunAfter(exec);
+        }
+
+        {
+            final JavaExec exec = makeTask("runServer", JavaExec.class);
+            requireJava8(exec);
+            project.afterEvaluate(project -> exec.workingDir(delayedFile("{RUN_DIR}")));
+            exec.doFirst(new MakeDirExist(delayedFile("{RUN_DIR}")));
+            JavaExecSpecHelper.setMainClass(exec, GRADLE_START_SERVER);
+            String[] jvmArgs = getExtension().getServerJvmArgs().isEmpty()
+                    ? new String[] {"-Dfml.ignoreInvalidMinecraftCertificates=true"}
+                    : getExtension().getServerJvmArgs().toArray(new String[0]);
+            exec.jvmArgs((Object[]) jvmArgs);
+            exec.args(getServerRunArgs());
+            exec.setStandardOutput(System.out);
+            exec.setStandardInput(System.in);
+            exec.setErrorOutput(System.err);
+
+            exec.setGroup("ForgeGradle");
+            exec.setDescription("Runs the Minecraft Server");
+
+            exec.dependsOn("makeStart");
+            project.getTasks().getByPath("reobf").mustRunAfter(exec);
+        }
+    }
+
+    private void requireJava8(final JavaExec exec) {
+        try {
+            JavaToolchainService toolchains = project.getExtensions().getByType(JavaToolchainService.class);
+            exec.getJavaLauncher().set(
+                    toolchains.launcherFor(spec -> spec.getLanguageVersion().set(JavaLanguageVersion.of(8)))
+            );
+        } catch (Throwable t) {
+            project.getLogger().error("Unsupported gradle version {}", project.getGradle().getGradleVersion(), t);
+        }
+    }
+
+    private void createSourceCopyTasks() {
+        SourceSet main = JavaExtensionHelper.getSourceSet(project).getByName(SourceSet.MAIN_SOURCE_SET_NAME);
+
+        // do the special source moving...
+        SourceCopyTask task;
+
+        // main
+        {
+            DelayedFile dir = delayedFile(SOURCES_DIR + "/java");
+
+            task = makeTask("sourceMainJava", SourceCopyTask.class);
+            task.setSource(main.getJava());
+            task.setOutput(dir);
+
+            JavaCompile compile = (JavaCompile) project.getTasks().getByName(main.getCompileJavaTaskName());
+            compile.dependsOn("sourceMainJava");
+            compile.setSource(dir);
+        }
+
+        // scala!!!
+        if (project.getPlugins().hasPlugin("scala")) {
+            SourceDirectorySet set;
+            DslObject dslObject = new DslObject(main);
+            if (GradleVersionUtils.isBefore("9.0")) {
+                if (GradleVersionUtils.isBefore("7.1")) {
+                    //Легаси gradle
+                    try {
+                        Object convention = dslObject.getClass().getMethod("getConvention").invoke(dslObject);
+                        Object plugins = convention.getClass().getMethod("getPlugins").invoke(convention);
+                        Object scalaSourceSet = ((java.util.Map<?, ?>) plugins).get("scala");
+                        set = (SourceDirectorySet) scalaSourceSet.getClass().getMethod("getScala").invoke(scalaSourceSet);
+                    } catch (Exception e) {
+                        throw new RuntimeException("Failed to get Scala source set", e);
+                    }
+                } else {
+                    set = dslObject.getExtensions().getByType(ScalaSourceDirectorySet.class);
+                }
+            } else {
+                set = dslObject.getExtensions().getByType(ScalaSourceDirectorySet.class);
+            }
+            DelayedFile dir = delayedFile(SOURCES_DIR + "/scala");
+
+            task = makeTask("sourceMainScala", SourceCopyTask.class);
+            task.setSource(set);
+            task.setOutput(dir);
+
+            ScalaCompile compile = (ScalaCompile) project.getTasks().getByName(main.getCompileTaskName("scala"));
+            compile.dependsOn("sourceMainScala");
+            compile.setSource(dir);
+        }
+
+        // groovy!!! (А кто вообще на нем моды пишет?)
+        if (project.getPlugins().hasPlugin("groovy")) {
+            SourceDirectorySet set;
+            DslObject dslObject = new DslObject(main);
+            if (GradleVersionUtils.isBefore("9.0")) {
+                if (GradleVersionUtils.isBefore("7.1")) {
+                    //Легаси gradle
+                    try {
+                        Object convention = dslObject.getClass().getMethod("getConvention").invoke(dslObject);
+                        Object plugins = convention.getClass().getMethod("getPlugins").invoke(convention);
+                        Object groovySourceSet = ((java.util.Map<?, ?>) plugins).get("groovy");
+                        set = (SourceDirectorySet) groovySourceSet.getClass().getMethod("getGroovy").invoke(groovySourceSet);
+                    } catch (Exception e) {
+                        throw new RuntimeException("Failed to get Groovy source set", e);
+                    }
+                } else {
+                    set = dslObject.getExtensions().getByType(GroovySourceDirectorySet.class);
+                }
+            } else {
+                set = dslObject.getExtensions().getByType(GroovySourceDirectorySet.class);
+            }
+            DelayedFile dir = delayedFile(SOURCES_DIR + "/groovy");
+
+            task = makeTask("sourceMainGroovy", SourceCopyTask.class);
+            task.setSource(set);
+            task.setOutput(dir);
+
+            GroovyCompile compile = (GroovyCompile) project.getTasks().getByName(main.getCompileTaskName("groovy"));
+            compile.dependsOn("sourceMainGroovy");
+            compile.setSource(dir);
+        }
+    }
+
+    @Override
+    public final void afterEvaluate() {
+        String mcversion = getMcVersion(getExtension());
+        if (!getExtension().mappingsSet() && mcversion.startsWith("1.8")) {
+            getExtension().setMappings("snapshot_20141001"); //Default snapshots for 1.8
+        }
+
+        super.afterEvaluate();
+
+        // version checks
+        {
+            String version = getMcVersion(getExtension());
+            if (hasApiVersion())
+                version = getApiVersion(getExtension());
+
+            doVersionChecks(version);
+        }
+
+        // avoid implicit_dependency warning
+        {
+            Task task;
+            task = project.getTasks().findByName("compileJava");
+            if (task != null) task.mustRunAfter("repackMinecraft");
+            task = project.getTasks().findByName("compileKotlin");
+            if (task != null) task.mustRunAfter("repackMinecraft");
+            task = project.getTasks().findByName("compileGroovy");
+            if (task != null) task.mustRunAfter("repackMinecraft");
+            task = project.getTasks().findByName("compileScala");
+            if (task != null) task.mustRunAfter("repackMinecraft");
+        }
+
+        // ensure plugin application sequence.. groovy or scala or wtvr first, then the forge/fml/liteloader plugins
+        if (!hasScalaBefore && project.getPlugins().hasPlugin("scala"))
+            throw new RuntimeException(delayedString("You have applied the 'scala' plugin after '{API_NAME}', you must apply it before.").call());
+        if (!hasGroovyBefore && project.getPlugins().hasPlugin("groovy"))
+            throw new RuntimeException(delayedString("You have applied the 'groovy' plugin after '{API_NAME}', you must apply it before.").call());
+
+        project.getDependencies().add(CONFIG_USERDEV, delayedString(getUserDev()).call() + ":userdev");
+
+        // grab the json && read dependencies
+        if (getDevJson().call().exists()) {
+            readAndApplyJson(getDevJson().call(), CONFIG_DEPS, CONFIG_NATIVES, project.getLogger());
+            readAndApplyJson(getDevJson().call(), CONFIG_DEPS_SETUP, CONFIG_NATIVES, project.getLogger());
+        }
+
+        // add MC repo.
+        final String repoDir = delayedDirtyFile("this", "doesnt", "matter").call().getParentFile().getAbsolutePath();
+        project.allprojects(proj -> {
+            addFlatRepo(proj, getApiName() + "FlatRepo", repoDir);
+            MavenArtifactRepository local = proj.getRepositories().mavenLocal();
+            if (proj == project)
+                generatedWorkspaceRepository = new File(local.getUrl());
+            proj.getLogger().debug("Adding repo to " + proj.getPath() + " >> " + repoDir);
+            if (wrapperArtifact) {
+                proj.getRepositories().ivy(r -> {
+                    r.setName(getApiName() + "WrapperIvyRepo");
+                    try {
+                        r.setUrl(new File(repoDir).toURI().toURL());
+                    } catch (MalformedURLException e) {
+                        throw new RuntimeException(e);
+                    }
+                    GradleVersionUtils.ifAfter("5.1", () -> r.content(cd -> cd.includeGroup(WRAPPER_ARTIFACT_GROUP_ID)));
+                    r.patternLayout(l -> {
+                        l.ivy("wrapper-of-[module]-[revision]-ivy.xml");
+                        l.artifact("wrapper-of-[module]-[revision]-ivy.[ext]");
+                    });
+                });
+            }
+        });
+
+        prepareGeneratedWorkspaceCache();
+        delayedTaskConfig();
+
+        // check for decompilation status.. has decompiled or not etc
+        final File decompFile = generatedWorkspaceArtifact(CLASSIFIER_SOURCES);
+        boolean setupDecompWorkspace = isSetupDecompWorkspaceRequested();
+
+        if (generatedWorkspaceCacheHit || decompFile.exists() || setupDecompWorkspace) {
+            getExtension().setDecomp();
+        }
+
+        // post decompile status thing.
+        configurePostDecomp(getExtension().isDecomp(), setupDecompWorkspace);
+
+        {
+            // stop getting empty dirs
+            Action<Zip> act = task -> task.setIncludeEmptyDirs(false);
+
+            project.getTasks().withType(Jar.class, act);
+            project.getTasks().withType(Zip.class, act);
+        }
+    }
+
+    /**
+     * Allows for the configuration of tasks in AfterEvaluate
+     */
+    protected void delayedTaskConfig() {
+        // add extraSRG lines to reobf task
+        {
+            ReobfTask task = ((ReobfTask) project.getTasks().getByName("reobf"));
+            task.reobf(project.getTasks().getByName("jar"), arg0 ->
+                    arg0.setClasspath(JavaExtensionHelper.getSourceSet(project).getByName(SourceSet.MAIN_SOURCE_SET_NAME).getCompileClasspath()));
+            task.setExtraSrg(getExtension().getSrgExtra());
+        }
+
+        // configure output of recompile task
+        {
+            JavaCompile compile = (JavaCompile) project.getTasks().getByName("recompMinecraft");
+            CompileTaskHelper.setDestinationDir(compile, delayedFile(RECOMP_CLS_DIR).call());
+        }
+
+        // configure output of repackage task.
+        {
+            Jar repackageTask = (Jar) project.getTasks().getByName("repackMinecraft");
+            final DelayedFile recomp = generatedWorkspaceArtifactDelayed(null);
+
+            //done in the delayed configuration.
+            File out = recomp.call();
+            ArchiveTaskHelper.setArchiveName(repackageTask, out.getName());
+            ArchiveTaskHelper.setDestinationDir(repackageTask, out.getParentFile());
+        }
+
+        {
+            // because different versions of authlib
+            CreateStartTask task = (CreateStartTask) project.getTasks().getByName("makeStart");
+
+            if (getMcVersion(getExtension()).startsWith("1.7")) // MC 1.7.X
+            {
+                if (getMcVersion(getExtension()).endsWith("10")) // MC 1.7.10
+                {
+                    task.addReplacement("//@@USERTYPE@@", "argMap.put(\"userType\", auth.getUserType().getName());");
+                    task.addReplacement("//@@USERPROP@@", "argMap.put(\"userProperties\", new GsonBuilder().registerTypeAdapter(com.mojang.authlib.properties.PropertyMap.class, new net.minecraftforge.gradle.OldPropertyMapSerializer()).create().toJson(auth.getUserProperties()));");
+                } else {
+                    task.removeResource("net/minecraftforge/gradle/OldPropertyMapSerializer.java");
+                }
+            } else // MC 1.8 +
+            {
+                task.removeResource("net/minecraftforge/gradle/OldPropertyMapSerializer.java");
+                task.addReplacement("//@@USERTYPE@@", "argMap.put(\"userType\", auth.getUserType().getName());");
+                task.addReplacement("//@@USERPROP@@", "argMap.put(\"userProperties\", new GsonBuilder().registerTypeAdapter(com.mojang.authlib.properties.PropertyMap.class, new com.mojang.authlib.properties.PropertyMap.Serializer()).create().toJson(auth.getUserProperties()));");
+            }
+        }
+
+        // Add the mod and stuff to the classpath of the exec tasks.
+        final Jar jarTask = (Jar) project.getTasks().getByName("jar");
+
+        JavaExec exec = (JavaExec) project.getTasks().getByName("runClient");
+        {
+            exec.classpath(project.getConfigurations().getByName(CONFIG_RUNTIME_CLASSPATH));
+            exec.classpath(ArchiveTaskHelper.getArchivePath(jarTask));
+            exec.dependsOn(jarTask);
+        }
+
+        exec = (JavaExec) project.getTasks().getByName("runServer");
+        {
+            exec.classpath(project.getConfigurations().getByName(CONFIG_RUNTIME_CLASSPATH));
+            exec.classpath(ArchiveTaskHelper.getArchivePath(jarTask));
+            exec.dependsOn(jarTask);
+        }
+
+        // configure source replacement.
+        for (SourceCopyTask t : project.getTasks().withType(SourceCopyTask.class)) {
+            t.replace(getExtension().getReplacements());
+            t.include(getExtension().getIncludes());
+        }
+    }
+
+    /**
+     * Configure tasks and stuff after you know if the decomp file exists or not.
+     *
+     * @param decomp will decompile this task
+     * @param remove should remove old dependencies or not
+     */
+    protected void configurePostDecomp(boolean decomp, boolean remove) {
+        if (decomp) {
+            ((ReobfTask) project.getTasks().getByName("reobf")).setDeobfFile(((ProcessJarTask) project.getTasks().getByName("deobfuscateJar")).getDelayedOutput());
+            ((ReobfTask) project.getTasks().getByName("reobf")).setRecompFile(generatedWorkspaceArtifactDelayed(null));
+        } else {
+            (project.getTasks().getByName(JavaPlugin.COMPILE_JAVA_TASK_NAME)).dependsOn("deobfBinJar");
+            (project.getTasks().getByName("compileApiJava")).dependsOn("deobfBinJar");
+        }
+
+        setMinecraftDeps(decomp, remove);
+
+        if (decomp && remove) {
+            project.getTasks().getByName("deobfBinJar").onlyIf(SPEC_FALSE);
+        }
+    }
+
+    protected void setMinecraftDeps(boolean decomp, boolean remove) {
+        String version = getMcVersion(getExtension());
+        if (hasApiVersion())
+            version = getApiVersion(getExtension());
+
+        if (wrapperArtifact) {
+            project.getDependencies().add(CONFIG_COMPILE, ImmutableMap.of("group", WRAPPER_ARTIFACT_GROUP_ID, "name", getApiName(), "version", version));
+        } else if (decomp) {
+            // Maven coordinates are content-addressed by the complete generated
+            // workspace inputs. They never get overwritten by another project's ATs.
+            if (generatedWorkspaceCacheHit) {
+                Dependency generated = project.getDependencies().create(ImmutableMap.of(
+                        "group", "net.minecraftforge.generated",
+                        "name", getSrcDepName(),
+                        "version", generatedWorkspaceVersion));
+                project.getDependencies().add(CONFIG_MC, generated);
+            } else {
+                project.getDependencies().add(CONFIG_MC, project.files(
+                        generatedWorkspaceArtifactDelayed(null)));
+            }
+            if (remove) {
+                project.getConfigurations().getByName(CONFIG_MC).exclude(ImmutableMap.of("module", getBinDepName()));
+            }
+        } else {
+            //project.getDependencies().add(CONFIG_MC, ImmutableMap.of("name", getBinDepName(), "version", version));
+            // Use file dependency on the output of deobfBinJar task to avoid resolution issues
+            // when the artifact doesn't exist yet (e.g., first Gradle refresh with AT files)
+            ProcessJarTask deobfBinJar = (ProcessJarTask) project.getTasks().getByName("deobfBinJar");
+            project.getDependencies().add(CONFIG_MC, project.files(deobfBinJar.getDelayedOutput()));
+            if (remove) {
+                project.getConfigurations().getByName(CONFIG_MC).exclude(ImmutableMap.of("module", getSrcDepName()));
+            }
+        }
+    }
+
+    /**
+     * Add Forge/FML ATs here.
+     * This happens during normal evaluation, and NOT AfterEvaluate.
+     *
+     * @param task the deobfuscation task
+     */
+    protected abstract void configureDeobfuscation(ProcessJarTask task);
+
+    /**
+     * @param version may have pre-release suffix _pre#
+     */
+    protected abstract void doVersionChecks(String version);
+
+    /**
+     * Returns a file in the DirtyDir if the deobfuscation task is dirty. Otherwise returns the cached one.
+     *
+     * @param name       the name..
+     * @param classifier the classifier
+     * @param ext        the extension
+     * @return delayed file
+     */
+    protected DelayedFile delayedDirtyFile(final String name, final String classifier, final String ext) {
+        return delayedDirtyFile(name, classifier, ext, true);
+    }
+
+    /**
+     * Returns a file in the DirtyDir if the deobfuscation task is dirty. Otherwise returns the cached one.
+     *
+     * @param name         the name..
+     * @param classifier   the classifier
+     * @param ext          the extension
+     * @param usesMappings whether or not MCP mappings are specified
+     * @return delayed file
+     */
+    @SuppressWarnings("serial")
+    protected DelayedFile delayedDirtyFile(final String name, final String classifier, final String ext, final boolean usesMappings) {
+        return new DelayedFile(project, "", this) {
+            @Override
+            public File resolveDelayed() {
+                ProcessJarTask decompDeobf = (ProcessJarTask) project.getTasks().getByName("deobfuscateJar");
+                pattern = (decompDeobf.isClean() ? "{API_CACHE_DIR}/" + (usesMappings ? MAPPING_APPENDAGE : "") : DIRTY_DIR) + "/";
+
+                if (!Strings.isNullOrEmpty(name))
+                    pattern += name;
+                else
+                    pattern += "{API_NAME}";
+
+                pattern += "-" + (hasApiVersion() ? "{API_VERSION}" : "{MC_VERSION}");
+
+                if (!Strings.isNullOrEmpty(classifier))
+                    pattern += "-" + classifier;
+                if (!Strings.isNullOrEmpty(ext))
+                    pattern += "." + ext;
+
+                return super.resolveDelayed();
+            }
+        };
+    }
+
+    @SuppressWarnings("unchecked")
+    protected Class<T> getExtensionClass() {
+        return (Class<T>) UserExtension.class;
+    }
+
+    private void addGitIgnore() {
+        File git = new File(ProjectBuildDirHelper.getBuildDir(project), ".gitignore");
+        if (!git.exists()) {
+            git.getParentFile().mkdir();
+            try {
+                Files.write(git.toPath(), "#Seriously guys, stop commiting this to your git repo!\r\n*".getBytes());
+            } catch (IOException e) {}
+        }
+    }
+}
