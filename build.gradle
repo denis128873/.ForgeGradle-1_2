@@ -5,8 +5,8 @@ plugins {
     id 'maven-publish'
 }
 
-group = "su.skycraft.build"
-version = "1.2-1.1.2-SNAPSHOT"
+group = System.getenv("JITPACK") ? "com.github.denis128873.ForgeGradle-1_2" : "su.skycraft.build"
+version = System.getenv("VERSION") ?: "1.2-1.1.2-SNAPSHOT"
 
 base {
     archivesName = "ForgeGradle"
